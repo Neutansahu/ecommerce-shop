@@ -1,0 +1,818 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-tier e-commerce app. Presentation tier: CloudFront + S3.
+  Application tier: ALB + Auto Scaling EC2 (Node/Express).
+  Data tier: RDS MySQL + S3 (product images). Secrets in Secrets Manager.
+
+# ---------------------------------------------------------------------------
+# PARAMETERS
+# ---------------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shop
+    AllowedPattern: '^[a-z][a-z0-9-]{1,20}$'
+    Description: Short lowercase name used in resource names and tags.
+
+  GitHubRepoUrl:
+    Type: String
+    AllowedPattern: '^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+    Description: HTTPS URL of your PUBLIC repo, without .git (example https://github.com/you/ecommerce-aws)
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: '^[A-Za-z0-9._/-]+$'
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  MinSize:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+
+  MaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 20
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.t4g.micro, db.t4g.small]
+
+  DBEngineVersion:
+    Type: String
+    Default: '8.4'
+    Description: MySQL major version. 8.0 left standard support on 31 Jul 2026, so use 8.4 (LTS).
+
+  DBMultiAZ:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Set true for production (doubles DB cost).
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Email address for CloudWatch alarm notifications.
+
+  RazorpayKeyId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Optional. Can be filled in later in Secrets Manager.
+
+  RazorpayKeySecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+
+  RazorpayWebhookSecret:
+    Type: String
+    Default: ''
+    NoEcho: true
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Optional custom domain (example shop.example.com). Needs CertificateArn too.
+
+  CertificateArn:
+    Type: String
+    Default: ''
+    Description: Optional ACM certificate ARN. It MUST be in us-east-1 (CloudFront requirement).
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Optional Route 53 hosted zone ID. If set with DomainName and CertificateArn, the DNS record is created for you.
+
+  CloudFrontPrefixListId:
+    Type: String
+    Default: ''
+    Description: >
+      Optional hardening. ID of the AWS managed prefix list
+      com.amazonaws.global.cloudfront.origin-facing in your region (VPC > Managed prefix lists).
+      When set, the load balancer only accepts traffic from CloudFront.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+# ---------------------------------------------------------------------------
+# CONDITIONS
+# ---------------------------------------------------------------------------
+Conditions:
+  UseMultiAz: !Equals [!Ref DBMultiAZ, 'true']
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  UsePrefixList: !Not [!Equals [!Ref CloudFrontPrefixListId, '']]
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, '']]
+    - !Not [!Equals [!Ref CertificateArn, '']]
+  HasDnsRecord: !And
+    - !Not [!Equals [!Ref DomainName, '']]
+    - !Not [!Equals [!Ref CertificateArn, '']]
+    - !Not [!Equals [!Ref HostedZoneId, '']]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # NETWORK: VPC, 2 public subnets (ALB + app), 2 private subnets (database)
+  # No NAT gateway, to keep cost low. App servers have public IPs but only
+  # accept traffic from the load balancer.
+  # -------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-2'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-1'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-2'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------------------------------------------------------
+  # SECURITY GROUPS: chain of trust  internet -> ALB -> app -> database
+  # -------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load balancer. HTTP in from CloudFront (or anywhere if no prefix list).
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - !If
+          - UsePrefixList
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            SourcePrefixListId: !Ref CloudFrontPrefixListId
+          - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb-sg'
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App servers. Port 3000 only from the load balancer. No SSH (use Session Manager).
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app-sg'
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database. MySQL only from the app servers.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-sg'
+
+  # -------------------------------------------------------------------------
+  # SECRETS
+  # The DB master password is generated and kept by RDS itself (see Database).
+  # -------------------------------------------------------------------------
+  JwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: JWT signing secret shared by every app server
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  RazorpaySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Razorpay keys. Edit the values in the console after creating the stack if left empty.
+      SecretString: !Sub '{"key_id":"${RazorpayKeyId}","key_secret":"${RazorpayKeySecret}","webhook_secret":"${RazorpayWebhookSecret}"}'
+
+  # -------------------------------------------------------------------------
+  # DATA TIER: RDS MySQL (private subnets) + S3 buckets
+  # -------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the database
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete # demo setting. Use Snapshot for real production data.
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: mysql
+      EngineVersion: !Ref DBEngineVersion
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      DBName: ecommerce
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      MultiAZ: !If [UseMultiAz, true, false]
+      PubliclyAccessible: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      CopyTagsToSnapshot: true
+      DeletionProtection: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db'
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${ImagesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  # -------------------------------------------------------------------------
+  # IAM: permissions for the app servers (no access keys anywhere)
+  # -------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: app-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: !Sub '${ImagesBucket.Arn}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !GetAtt Database.MasterUserSecret.SecretArn
+                  - !Ref JwtSecret
+                  - !Ref RazorpaySecret
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # -------------------------------------------------------------------------
+  # APPLICATION TIER: ALB + Auto Scaling group of EC2 servers
+  # Servers pull the code from GitHub when they boot, so a new code version
+  # is deployed by an instance refresh (no AMI baking).
+  # -------------------------------------------------------------------------
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-alb'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VPC
+      Port: 3000
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref AppSecurityGroup
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-app'
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            exec > >(tee /var/log/shop-userdata.log) 2>&1
+            set -eux
+
+            dnf install -y git jq nodejs22 nodejs22-npm
+
+            # ---- non-secret settings (secrets are fetched at start-up, never stored on disk)
+            cat > /etc/shop.conf <<'EOF'
+            export AWS_REGION="${AWS::Region}"
+            export AWS_DEFAULT_REGION="${AWS::Region}"
+            export DB_HOST="${Database.Endpoint.Address}"
+            export DB_NAME="ecommerce"
+            export DB_SECRET_ARN="${Database.MasterUserSecret.SecretArn}"
+            export JWT_SECRET_ARN="${JwtSecret}"
+            export RAZORPAY_SECRET_ARN="${RazorpaySecret}"
+            export S3_BUCKET="${ImagesBucket}"
+            export PORT="3000"
+            EOF
+
+            # ---- sourceable helper: loads all settings + secrets into the environment
+            cat > /usr/local/bin/shop-env.sh <<'EOF'
+            #!/bin/bash
+            source /etc/shop.conf
+            DB_SECRET=$(aws secretsmanager get-secret-value --secret-id "$DB_SECRET_ARN" --query SecretString --output text)
+            export DB_USER=$(echo "$DB_SECRET" | jq -r .username)
+            export DB_PASSWORD=$(echo "$DB_SECRET" | jq -r .password)
+            export JWT_SECRET=$(aws secretsmanager get-secret-value --secret-id "$JWT_SECRET_ARN" --query SecretString --output text)
+            RZP=$(aws secretsmanager get-secret-value --secret-id "$RAZORPAY_SECRET_ARN" --query SecretString --output text)
+            export RAZORPAY_KEY_ID=$(echo "$RZP" | jq -r .key_id)
+            export RAZORPAY_KEY_SECRET=$(echo "$RZP" | jq -r .key_secret)
+            export RAZORPAY_WEBHOOK_SECRET=$(echo "$RZP" | jq -r .webhook_secret)
+            EOF
+
+            # ---- service start script
+            cat > /usr/local/bin/start-shop.sh <<'EOF'
+            #!/bin/bash
+            set -eu
+            source /usr/local/bin/shop-env.sh
+            cd /opt/shop/server
+            node init-db.js
+            exec node server.js
+            EOF
+            chmod 755 /usr/local/bin/shop-env.sh /usr/local/bin/start-shop.sh
+
+            # ---- get the code
+            useradd --system --home-dir /opt/shop --shell /sbin/nologin shop || true
+            git clone --depth 1 --branch "${GitHubBranch}" "${GitHubRepoUrl}" /opt/shop
+            cd /opt/shop/server
+            npm install --omit=dev
+            chown -R shop:shop /opt/shop
+
+            # ---- run as a systemd service (starts on boot, restarts on crash)
+            cat > /etc/systemd/system/shop.service <<'EOF'
+            [Unit]
+            Description=Shop API
+            After=network-online.target
+            Wants=network-online.target
+
+            [Service]
+            User=shop
+            WorkingDirectory=/opt/shop/server
+            ExecStart=/usr/local/bin/start-shop.sh
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            systemctl daemon-reload
+            systemctl enable --now shop
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Listener
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref MinSize
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app'
+          PropagateAtLaunch: true
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60
+
+  # -------------------------------------------------------------------------
+  # PRESENTATION TIER: CloudFront in front of S3 (site, images) and the ALB (/api/*)
+  # Cache policy IDs below are AWS managed policies:
+  #   658327ea... CachingOptimized | 4135ea2d... CachingDisabled
+  #   b689b0a8... AllViewerExceptHostHeader
+  # -------------------------------------------------------------------------
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-oac-${AWS::StackName}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} storefront'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Aliases: !If
+          - HasCustomDomain
+          - [!Ref DomainName]
+          - !Ref 'AWS::NoValue'
+        Origins:
+          - Id: frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: images
+            DomainName: !GetAtt ImagesBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          - Id: api
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 30
+        DefaultCacheBehavior:
+          TargetOriginId: frontend
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: /images/*
+            TargetOriginId: images
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate: !If
+          - HasCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasDnsRecord
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2 # fixed ID for all CloudFront distributions
+
+  # -------------------------------------------------------------------------
+  # MONITORING: alarms (email only if AlertEmail is set)
+  # -------------------------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Application returned more than 5 server errors in 5 minutes
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: At least one app server is failing the load balancer health check
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
+
+  DbCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database CPU above 80 percent for 10 minutes
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
+
+  DbStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Database has less than 2 GB free storage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 2000000000
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlertEmail, [!Ref AlertTopic], !Ref 'AWS::NoValue']
+
+# ---------------------------------------------------------------------------
+# OUTPUTS
+# ---------------------------------------------------------------------------
+Outputs:
+  SiteUrl:
+    Description: Open this in the browser
+    Value: !If
+      - HasCustomDomain
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${Distribution.DomainName}'
+  CloudFrontDomain:
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution
+  FrontendBucketName:
+    Description: Upload the React build (dist) here
+    Value: !Ref FrontendBucket
+  ImagesBucketName:
+    Value: !Ref ImagesBucket
+  LoadBalancerDns:
+    Value: !GetAtt LoadBalancer.DNSName
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  DatabaseEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+  DatabaseSecretArn:
+    Description: RDS-managed master password (Secrets Manager)
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+  RazorpaySecretArn:
+    Description: Edit this secret to add or change the Razorpay keys
+    Value: !Ref RazorpaySecret
